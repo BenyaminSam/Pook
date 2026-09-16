@@ -1,0 +1,9 @@
+apiVersion: storage.pook.io/v1alpha1
+kind: RBDMirror
+metadata:
+  labels:
+    app.kubernetes.io/name: pook
+    app.kubernetes.io/managed-by: kustomize
+  name: rbdmirror-sample
+spec:
+  # TODO(user): Add fields here
