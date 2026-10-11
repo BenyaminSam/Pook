@@ -1,9 +1,32 @@
 apiVersion: storage.pook.io/v1alpha1
 kind: RBDMirror
 metadata:
+  name: rbdmirror-sample
+  namespace: default
   labels:
     app.kubernetes.io/name: pook
     app.kubernetes.io/managed-by: kustomize
-  name: rbdmirror-sample
 spec:
-  # TODO(user): Add fields here
+  localCluster:
+    clusterID: "37d4a3c1-7dc2-11f1-bda6-00505680ad60"
+    clientName: client.pook
+    configSecretRef:
+      name: pook-local-ceph
+    credentialsSecretRef:
+      name: pook-local-ceph
+
+  peerCluster:
+    clusterID: "437e0f5e-aee8-11f1-908d-00505680dfe5"
+    clientName: client.pook
+    configSecretRef:
+      name: pook-peer-ceph
+    credentialsSecretRef:
+      name: pook-peer-ceph
+
+  pools:
+    - name: replicated-pool
+      mode: journal
+      direction: rx-tx
+
+  daemon:
+    replicas: 1

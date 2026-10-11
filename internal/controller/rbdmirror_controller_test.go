@@ -54,20 +54,53 @@ var _ = Describe("RBDMirror Controller", func() {
 						Name:      resourceName,
 						Namespace: resourceNamespace,
 					},
-					// TODO(user): Specify other spec details if needed.
+					Spec: storagev1alpha1.RBDMirrorSpec{
+						LocalCluster: storagev1alpha1.CephClusterConnectionSpec{
+							ClusterID: "11111111-1111-4111-8111-111111111111",
+							ConfigSecretRef: storagev1alpha1.CephSecretReference{
+								Name: "local-ceph-config",
+							},
+							CredentialsSecretRef: storagev1alpha1.CephSecretReference{
+								Name: "local-ceph-keyring",
+							},
+						},
+						PeerCluster: storagev1alpha1.CephClusterConnectionSpec{
+							ClusterID: "22222222-2222-4222-8222-222222222222",
+							ConfigSecretRef: storagev1alpha1.CephSecretReference{
+								Name: "peer-ceph-config",
+							},
+							CredentialsSecretRef: storagev1alpha1.CephSecretReference{
+								Name: "peer-ceph-keyring",
+							},
+						},
+						Pools: []storagev1alpha1.RBDMirrorPoolSpec{
+							{
+								Name:      "replicated-pool",
+								Mode:      "journal",
+								Direction: "rx-tx",
+							},
+						},
+					},
 				}
 				Expect(k8sClient.Create(ctx, resource)).To(Succeed())
+			} else {
+				Expect(err).NotTo(HaveOccurred())
 			}
 		})
 
 		AfterEach(func() {
-			// TODO(user): Cleanup logic after each test, like removing the resource instance.
-			resource := &storagev1alpha1.RBDMirror{}
-			err := k8sClient.Get(ctx, typeNamespacedName, resource)
-			Expect(err).NotTo(HaveOccurred())
+			By("cleaning up the RBDMirror resource")
+			resource := &storagev1alpha1.RBDMirror{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      resourceName,
+					Namespace: resourceNamespace,
+				},
+			}
 
-			By("Cleanup the specific resource instance RBDMirror")
-			Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
+			err := k8sClient.Delete(ctx, resource)
+			if !errors.IsNotFound(err) {
+				Expect(err).NotTo(HaveOccurred())
+			}
 		})
 		It("should successfully reconcile the resource", func() {
 			By("Reconciling the created resource")

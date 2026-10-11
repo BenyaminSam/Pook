@@ -1,63 +1,183 @@
-/*
-Copyright 2026.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
 package controller
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"time"
 
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
+	logger "sigs.k8s.io/controller-runtime/pkg/log"
 
 	storagev1alpha1 "github.com/BenyaminSam/pook/api/v1alpha1"
+	"github.com/BenyaminSam/pook/internal/ceph"
 )
 
-// RBDMirrorReconciler reconciles a RBDMirror object
+const (
+	poolMirroringStableRequeueAfter       = 30 * time.Second
+	poolMirroringVerificationRequeueAfter = 10 * time.Second
+)
+
 type RBDMirrorReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+
+	CephExecutor ceph.CommandExecutor
 }
 
-// +kubebuilder:rbac:groups=storage.pook.io,resources=rbdmirrors,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=storage.pook.io,resources=rbdmirrors,verbs=get;list;watch
 // +kubebuilder:rbac:groups=storage.pook.io,resources=rbdmirrors/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=storage.pook.io,resources=rbdmirrors/finalizers,verbs=update
-
-// Reconcile is part of the main kubernetes reconciliation loop which aims to
-// move the current state of the cluster closer to the desired state.
-// TODO(user): Modify the Reconcile function to compare the state specified by
-// the RBDMirror object against the actual cluster state, and then
-// perform operations to make the cluster state reflect the state specified by
-// the user.
-//
-// For more details, check Reconcile and its Result here:
-// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.24.1/pkg/reconcile
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
 func (r *RBDMirrorReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	_ = logf.FromContext(ctx)
+	logger := logger.FromContext(ctx).WithValues("rbdmirror", req.NamespacedName)
 
-	// TODO(user): your logic here
+	mirror := &storagev1alpha1.RBDMirror{}
 
-	return ctrl.Result{}, nil
+	if err := r.Get(ctx, req.NamespacedName, mirror); err != nil {
+		if apierrors.IsNotFound(err) {
+			logger.V(1).Info("RBDMirror no longer exists")
+			return ctrl.Result{}, nil
+		}
+		return ctrl.Result{}, fmt.Errorf("get RBDMirror %s: %w", req.NamespacedName, err)
+	}
+
+	if !mirror.DeletionTimestamp.IsZero() {
+		logger.V(1).Info("Skipping RBDMirror marked for deletion")
+		return ctrl.Result{}, nil
+	}
+
+	logger.V(1).Info("Fetched RBDMirror", "generation", mirror.Generation)
+
+	desiredPools, err := normalizePoolMirroring(mirror.Spec.Pools)
+	if err != nil {
+		before := mirror.DeepCopy()
+		applyPoolPlanningStatus(mirror, true, "InvalidMirroringSpec", err.Error())
+		if err := r.patchStatus(ctx, before, mirror); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, nil
+	}
+
+	validation := r.validateDependencies(ctx, mirror)
+
+	if validation.err != nil || !validation.valid {
+		before := mirror.DeepCopy()
+
+		applyDependencyStatus(mirror, validation)
+
+		if err := r.patchStatus(ctx, before, mirror); err != nil {
+			return ctrl.Result{}, err
+		}
+
+		if validation.err != nil {
+			return ctrl.Result{}, validation.err
+		}
+
+		return ctrl.Result{
+			RequeueAfter: validation.requeueAfter,
+		}, nil
+	}
+
+	observations, observation := r.observeCephConnections(ctx, validation, mirror.Spec.Pools)
+
+	if observation.err != nil || !observation.valid {
+		before := mirror.DeepCopy()
+
+		applyCephObservationStatus(mirror, observation)
+
+		if err := r.patchStatus(ctx, before, mirror); err != nil {
+			return ctrl.Result{}, err
+		}
+
+		if observation.err != nil {
+			return ctrl.Result{}, observation.err
+		}
+		return ctrl.Result{RequeueAfter: observation.requeueAfter}, nil
+	}
+
+	plan := buildPoolMirroringPlan(desiredPools, observations)
+
+	logger.V(1).Info(
+		"Planned pool mirroring configuration",
+		"localPoolCount", len(observations.localPools),
+		"peerPoolCount", len(observations.peerPools),
+		"actionCount", len(plan.actions),
+		"conflictCount", len(plan.conflicts),
+	)
+
+	before := mirror.DeepCopy()
+	requeueAfter := poolMirroringStableRequeueAfter
+
+	switch {
+	case len(plan.conflicts) > 0:
+		applyPoolPlanningStatus(mirror, true, "PoolMirroringConflict", plan.conflictMessage())
+	case len(plan.actions) > 0:
+		executionErr := r.executePoolMirroringPlan(ctx, validation, plan)
+		if executionErr != nil {
+			applyPoolPlanningStatus(mirror, true, "PoolMirroringExecutionFailed", "Pool mirroring execution failed; any completed changes are preserved and Ceph will be observed again before retrying")
+			if patchErr := r.patchStatus(ctx, before, mirror); patchErr != nil {
+				return ctrl.Result{}, errors.Join(executionErr, patchErr)
+			}
+			return ctrl.Result{}, executionErr
+		}
+		requeueAfter = poolMirroringVerificationRequeueAfter
+		applyPoolPlanningStatus(mirror, false, "PoolMirroringVerificationPending", "Pool peer bootstrap operations completed; a fresh Ceph observation is required to verify peer identities and directions")
+		if patchErr := r.patchStatus(ctx, before, mirror); patchErr != nil {
+			return ctrl.Result{}, patchErr
+		}
+		return ctrl.Result{
+			RequeueAfter: poolMirroringVerificationRequeueAfter,
+		}, nil
+	default:
+		peerPlan := buildPoolPeerPlan(desiredPools, observations)
+		logger.V(1).Info("Planned pool peer configuration ", "actionCount", len(peerPlan.actions), "conflictCount", len(peerPlan.conflicts))
+		switch {
+		case len(peerPlan.conflicts) > 0:
+			applyPoolPlanningStatus(mirror, true, "PoolPeerConflict", peerPlan.conflictMessage())
+		case len(peerPlan.actions) > 0:
+			executionErr := r.executePoolPeerPlan(ctx, validation, peerPlan)
+			if executionErr != nil {
+				applyPoolPlanningStatus(mirror, true, "PoolPeerExecutionFailed", "Pool peer execution failed; Ceph will be observed again before retrying")
+			}
+			if patchErr := r.patchStatus(ctx, before, mirror); patchErr != nil {
+				if executionErr != nil {
+					return ctrl.Result{}, errors.Join(executionErr, patchErr)
+				}
+				return ctrl.Result{}, patchErr
+			}
+
+			if executionErr != nil {
+				return ctrl.Result{}, executionErr
+			}
+
+			return ctrl.Result{
+				RequeueAfter: poolMirroringVerificationRequeueAfter,
+			}, nil
+		default:
+			applyPoolPlanningStatus(mirror, false, "PoolConfigurationObserved", "Peer identites and directions match on both clusters; credentials, daemon availabilirt, and replication health remain unchecked ")
+		}
+	}
+
+	if err := r.patchStatus(ctx, before, mirror); err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{RequeueAfter: requeueAfter}, nil
 }
 
-// SetupWithManager sets up the controller with the Manager.
 func (r *RBDMirrorReconciler) SetupWithManager(mgr ctrl.Manager) error {
+
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &storagev1alpha1.RBDMirror{}, rbdMirrorSecretRefIndex, indexRBDMirrorSecretRef); err != nil {
+		return fmt.Errorf("Index RBDMirror secret reference: %w", err)
+	}
+
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&storagev1alpha1.RBDMirror{}).
+		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.mapSecretToRBDMirrors)).
 		Named("rbdmirror").
 		Complete(r)
 }
