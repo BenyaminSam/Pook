@@ -21,8 +21,8 @@ COPY . .
 # by leaving it empty we can ensure that the container and binary shipped on it will have the same platform.
 RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o manager cmd/main.go
 
-# Use distroless as minimal base image to package the manager binary
-# Refer to https://github.com/GoogleContainerTools/distroless for more details
+# The runtime includes the ceph and rbd CLI tools used by the controller.
+# Run the manager as an unprivileged user.
 FROM quay.io/ceph/ceph:v20.2.4-20260818
 WORKDIR /
 COPY --from=builder /workspace/manager .

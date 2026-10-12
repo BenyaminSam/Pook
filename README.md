@@ -1,135 +1,267 @@
-# pook
-// TODO(user): Add simple overview of use/purpose
+# Pook
 
-## Description
-// TODO(user): An in-depth paragraph about your project and overview of use
+Pook is a Kubernetes operator for configuring Ceph RBD mirroring between two existing Ceph clusters.
 
-## Getting Started
+It uses an `RBDMirror` custom resource to describe cluster connections and pool mirroring settings. The controller reads connection information from Kubernetes Secrets, observes Ceph configuration, and reconciles pool mirroring and peer relationships.
 
-### Prerequisites
-- go version v1.24.6+
-- docker version 17.03+.
-- kubectl version v1.11.3+.
-- Access to a Kubernetes v1.11.3+ cluster.
+## Project Status
 
-### To Deploy on the cluster
-**Build and push your image to the location specified by `IMG`:**
+**Pook is under active development and is not ready for production use.**
+
+The current implementation is an early foundation. Many features are planned, and substantial functionality remains to be implemented. The API, configuration, and behavior may change as development progresses.
+
+Use Pook only in isolated development and test environments.
+
+## Current Scope
+
+- Kubernetes custom resources for mirroring configuration.
+- Ceph connection settings stored in Kubernetes Secrets.
+- Cluster identity and pool configuration checks.
+- Pool-level mirroring configuration.
+- Peer bootstrap operations.
+- Reconciliation status reported through resource conditions.
+
+## Planned Work
+
+- Management of `rbd-mirror` daemons.
+- Replication health monitoring and readiness reporting.
+- Expanded peer lifecycle management.
+- Explicit ownership and cleanup policies.
+- Broader unit and integration test coverage.
+- End-to-end validation against Ceph clusters.
+- A documented Kubernetes and Ceph compatibility matrix.
+- Versioned releases and installation artifacts.
+
+These features are planned work, not capabilities of the current implementation.
+
+## Prerequisites
+
+For development and testing:
+
+- Go matching the version declared in `go.mod`.
+- Docker or a compatible container build tool.
+- `kubectl` and access to a development Kubernetes cluster.
+- Permission to install CRDs and the operator's RBAC resources.
+- Two Ceph clusters reachable from the operator.
+- An existing pool with the same name on both Ceph clusters.
+- Ceph client credentials authorized for the required operations.
+
+Testing actual data replication also requires separately managed `rbd-mirror` daemons and appropriately configured RBD images.
+
+## Build and Deploy
+
+Clone the repository:
 
 ```sh
-make docker-build docker-push IMG=<some-registry>/pook:tag
+git clone https://github.com/BenyaminSam/Pook.git
+cd Pook
 ```
 
-**NOTE:** This image ought to be published in the personal registry you specified.
-And it is required to have access to pull the image from the working environment.
-Make sure you have the proper permission to the registry if the above commands don’t work.
-
-**Install the CRDs into the cluster:**
+Set an image repository that you can push to:
 
 ```sh
+export IMG=registry.example.com/your-team/pook:dev
+```
+
+Build, push, and deploy:
+
+```sh
+make docker-build docker-push IMG="$IMG"
 make install
+make deploy IMG="$IMG"
 ```
 
-**Deploy the Manager to the cluster with the image specified by `IMG`:**
+Check the deployment:
 
 ```sh
-make deploy IMG=<some-registry>/pook:tag
+kubectl rollout status \
+  deployment/pook-controller-manager \
+  -n pook-system
 ```
 
-> **NOTE**: If you encounter RBAC errors, you may need to grant yourself cluster-admin
-privileges or be logged in as admin.
+The Kubernetes nodes must be able to pull the image. Configure image pull credentials separately when using a private registry.
 
-**Create instances of your solution**
-You can apply the samples (examples) from the config/sample:
+## Example
+
+This example configures bidirectional mirroring for an existing pool named `replicated-pool`.
+
+Run it only against test clusters. Applying an `RBDMirror` allows the controller to modify Ceph configuration.
+
+### 1. Create a Namespace
 
 ```sh
-kubectl apply -k config/samples/
+kubectl create namespace pook-demo
 ```
 
->**NOTE**: Ensure that the samples has default values to test it out.
+### 2. Create Connection Secrets
 
-### To Uninstall
-**Delete the instances (CRs) from the cluster:**
+Prepare a configuration file and client keyring for each cluster:
+
+```text
+local/
+  ceph.conf
+  ceph.client.pook.keyring
+
+peer/
+  ceph.conf
+  ceph.client.pook.keyring
+```
+
+Create the Secrets:
 
 ```sh
-kubectl delete -k config/samples/
+kubectl -n pook-demo create secret generic pook-local-ceph \
+  --from-file=ceph.conf=./local/ceph.conf \
+  --from-file=keyring=./local/ceph.client.pook.keyring
+
+kubectl -n pook-demo create secret generic pook-peer-ceph \
+  --from-file=ceph.conf=./peer/ceph.conf \
+  --from-file=keyring=./peer/ceph.client.pook.keyring
 ```
 
-**Delete the APIs(CRDs) from the cluster:**
+Secrets must be in the same namespace as the `RBDMirror` resource. The required data keys are `ceph.conf` and `keyring`.
+
+Do not commit credentials, keyrings, or bootstrap tokens to version control.
+
+### 3. Create an RBDMirror
+
+Save the following as `rbdmirror.yaml`.
+
+Replace the cluster IDs with your actual Ceph FSIDs. Adjust the client and pool names to match your environment.
+
+```yaml
+apiVersion: storage.pook.io/v1alpha1
+kind: RBDMirror
+metadata:
+  name: example
+  namespace: pook-demo
+spec:
+  localCluster:
+    clusterID: "<local-ceph-fsid>"
+    clientName: client.pook
+    configSecretRef:
+      name: pook-local-ceph
+    credentialsSecretRef:
+      name: pook-local-ceph
+
+  peerCluster:
+    clusterID: "<peer-ceph-fsid>"
+    clientName: client.pook
+    configSecretRef:
+      name: pook-peer-ceph
+    credentialsSecretRef:
+      name: pook-peer-ceph
+
+  pools:
+    - name: replicated-pool
+      mode: journal
+      direction: rx-tx
+```
+
+Apply the resource:
 
 ```sh
-make uninstall
+kubectl apply -f rbdmirror.yaml
 ```
 
-**UnDeploy the controller from the cluster:**
+### 4. Inspect Reconciliation
+
+```sh
+kubectl -n pook-demo get rbdmirror example -o yaml
+
+kubectl -n pook-demo describe rbdmirror example
+
+kubectl -n pook-system logs \
+  deployment/pook-controller-manager \
+  -c manager \
+  --tail=100
+```
+
+Resource conditions describe the controller's configuration assessment. Verify actual data replication independently with Ceph tooling; replication-health reporting is planned work.
+
+## Development
+
+Generate manifests and code:
+
+```sh
+make manifests generate
+```
+
+Format, test, and lint:
+
+```sh
+make fmt vet
+make test
+make lint
+```
+
+List available commands:
+
+```sh
+make help
+```
+
+The test target uses envtest and downloads Kubernetes test binaries.
+
+To run the controller locally:
+
+```sh
+make run
+```
+
+Local execution uses your current Kubernetes context and requires the Ceph CLI tools. Use a dedicated development context and test Ceph clusters.
+
+## Repository Layout
+
+```text
+api/v1alpha1/        Custom resource API definitions
+cmd/                 Controller manager entry point
+internal/controller/ Reconciliation, planning, and status
+internal/ceph/       Ceph CLI execution and connection handling
+internal/kubernetes/ Kubernetes Secret helpers
+config/              CRDs, RBAC, deployment, and samples
+hack/                Development support files
+```
+
+Generate CRDs and RBAC with `make manifests`, and DeepCopy implementations with `make generate`. Do not edit generated files directly.
+
+## Uninstall
+
+Deleting an `RBDMirror` does not undo the Ceph configuration created during reconciliation. Manage existing peer relationships and mirrored data separately.
+
+Remove the example resource:
+
+```sh
+kubectl -n pook-demo delete rbdmirror example
+```
+
+Remove the controller:
 
 ```sh
 make undeploy
 ```
 
-## Project Distribution
-
-Following the options to release and provide this solution to the users.
-
-### By providing a bundle with all YAML files
-
-1. Build the installer for the image built and published in the registry:
+Remove the CRD only when all `RBDMirror` resources are no longer needed:
 
 ```sh
-make build-installer IMG=<some-registry>/pook:tag
+make uninstall
 ```
 
-**NOTE:** The makefile target mentioned above generates an 'install.yaml'
-file in the dist directory. This file contains all the resources built
-with Kustomize, which are necessary to install this project without its
-dependencies.
+Removing the CRD deletes all remaining `RBDMirror` resources across the Kubernetes cluster.
 
-2. Using the installer
-
-Users can just run 'kubectl apply -f <URL for YAML BUNDLE>' to install
-the project, i.e.:
-
-```sh
-kubectl apply -f https://raw.githubusercontent.com/<org>/pook/<tag or branch>/dist/install.yaml
-```
-
-### By providing a Helm Chart
-
-1. Build the chart using the optional helm plugin
-
-```sh
-kubebuilder edit --plugins=helm/v2-alpha
-```
-
-2. See that a chart was generated under 'dist/chart', and users
-can obtain this solution from there.
-
-**NOTE:** If you change the project, you need to update the Helm Chart
-using the same command above to sync the latest changes. Furthermore,
-if you create webhooks, you need to use the above command with
-the '--force' flag and manually ensure that any custom configuration
-previously added to 'dist/chart/values.yaml' or 'dist/chart/manager/manager.yaml'
-is manually re-applied afterwards.
+Delete connection Secrets separately when they are no longer required.
 
 ## Contributing
-// TODO(user): Add detailed information on how you would like others to contribute to this project
 
-**NOTE:** Run `make help` for more information on all potential `make` targets
+The project is evolving, and focused contributions are welcome.
 
-More information can be found via the [Kubebuilder Documentation](https://book.kubebuilder.io/introduction.html)
+For changes to controller behavior, include tests covering the affected reconciliation paths. Regenerate manifests and code when needed, and run tests and linting before submitting a pull request.
 
-## License
+When reporting an issue, include:
 
-Copyright 2026.
+- The project commit or version.
+- Kubernetes and Ceph versions.
+- Steps to reproduce the behavior.
+- Sanitized resource conditions and logs.
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-
+Never include credentials, keyrings, or bootstrap tokens.

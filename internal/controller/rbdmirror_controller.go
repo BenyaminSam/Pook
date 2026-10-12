@@ -115,57 +115,95 @@ func (r *RBDMirrorReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 
 	switch {
 	case len(plan.conflicts) > 0:
-		applyPoolPlanningStatus(mirror, true, "PoolMirroringConflict", plan.conflictMessage())
+		applyPoolPlanningStatus(
+			mirror,
+			true,
+			"PoolMirroringConflict",
+			plan.conflictMessage(),
+		)
+
 	case len(plan.actions) > 0:
-		executionErr := r.executePoolMirroringPlan(ctx, validation, plan)
-		if executionErr != nil {
-			applyPoolPlanningStatus(mirror, true, "PoolMirroringExecutionFailed", "Pool mirroring execution failed; any completed changes are preserved and Ceph will be observed again before retrying")
+		if executionErr := r.executePoolMirroringPlan(ctx, validation, plan); executionErr != nil {
+			applyPoolPlanningStatus(
+				mirror,
+				true,
+				"PoolMirroringExecutionFailed",
+				"Pool mirroring execution failed; completed changes are preserved and Ceph will be observed again before retrying",
+			)
+
 			if patchErr := r.patchStatus(ctx, before, mirror); patchErr != nil {
 				return ctrl.Result{}, errors.Join(executionErr, patchErr)
 			}
+
 			return ctrl.Result{}, executionErr
 		}
+
 		requeueAfter = poolMirroringVerificationRequeueAfter
-		applyPoolPlanningStatus(mirror, false, "PoolMirroringVerificationPending", "Pool peer bootstrap operations completed; a fresh Ceph observation is required to verify peer identities and directions")
-		if patchErr := r.patchStatus(ctx, before, mirror); patchErr != nil {
-			return ctrl.Result{}, patchErr
-		}
-		return ctrl.Result{
-			RequeueAfter: poolMirroringVerificationRequeueAfter,
-		}, nil
+
+		applyPoolPlanningStatus(
+			mirror,
+			false,
+			"PoolMirroringVerificationPending",
+			"Pool mirroring enable operations completed; waiting for a fresh Ceph observation",
+		)
+
 	default:
 		peerPlan := buildPoolPeerPlan(desiredPools, observations)
-		logger.V(1).Info("Planned pool peer configuration ", "actionCount", len(peerPlan.actions), "conflictCount", len(peerPlan.conflicts))
+
+		logger.V(1).Info(
+			"Planned pool peer configuration",
+			"actionCount", len(peerPlan.actions),
+			"conflictCount", len(peerPlan.conflicts),
+		)
+
 		switch {
 		case len(peerPlan.conflicts) > 0:
-			applyPoolPlanningStatus(mirror, true, "PoolPeerConflict", peerPlan.conflictMessage())
+			applyPoolPlanningStatus(
+				mirror,
+				true,
+				"PoolPeerConflict",
+				peerPlan.conflictMessage(),
+			)
+
 		case len(peerPlan.actions) > 0:
-			executionErr := r.executePoolPeerPlan(ctx, validation, peerPlan)
-			if executionErr != nil {
-				applyPoolPlanningStatus(mirror, true, "PoolPeerExecutionFailed", "Pool peer execution failed; Ceph will be observed again before retrying")
-			}
-			if patchErr := r.patchStatus(ctx, before, mirror); patchErr != nil {
-				if executionErr != nil {
+			if executionErr := r.executePoolPeerPlan(ctx, validation, peerPlan); executionErr != nil {
+				applyPoolPlanningStatus(
+					mirror,
+					true,
+					"PoolPeerExecutionFailed",
+					"Pool peer execution failed; Ceph will be observed again before retrying",
+				)
+
+				if patchErr := r.patchStatus(ctx, before, mirror); patchErr != nil {
 					return ctrl.Result{}, errors.Join(executionErr, patchErr)
 				}
-				return ctrl.Result{}, patchErr
-			}
 
-			if executionErr != nil {
 				return ctrl.Result{}, executionErr
 			}
 
-			return ctrl.Result{
-				RequeueAfter: poolMirroringVerificationRequeueAfter,
-			}, nil
+			requeueAfter = poolMirroringVerificationRequeueAfter
+
+			applyPoolPlanningStatus(
+				mirror,
+				false,
+				"PoolPeerVerificationPending",
+				"Peer bootstrap operations completed; waiting for a fresh Ceph observation",
+			)
+
 		default:
-			applyPoolPlanningStatus(mirror, false, "PoolConfigurationObserved", "Peer identites and directions match on both clusters; credentials, daemon availabilirt, and replication health remain unchecked ")
+			applyPoolPlanningStatus(
+				mirror,
+				false,
+				"PoolConfigurationObserved",
+				"Peer identities and directions match on both clusters; peer credentials, daemon availability, and replication health have not been verified",
+			)
 		}
 	}
 
 	if err := r.patchStatus(ctx, before, mirror); err != nil {
 		return ctrl.Result{}, err
 	}
+
 	return ctrl.Result{RequeueAfter: requeueAfter}, nil
 }
 

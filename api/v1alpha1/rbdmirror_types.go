@@ -34,11 +34,11 @@ const (
 	RBDMirrorReasonSecretReferenceInvalid = "SecretReferenceInvalid"
 	RBDMirrorReasonMirroringNotConfigured = "MirroringNotConfigured"
 
-	RBDMirrorReasonCephExecutorUnavailable         = "CephExecutorUnavailabe"
-	RBDMirrorReasonCephConnectionPreparationFailed = "CephConnectionPreparationFaield"
+	RBDMirrorReasonCephExecutorUnavailable         = "CephExecutorUnavailable"
+	RBDMirrorReasonCephConnectionPreparationFailed = "CephConnectionPreparationFailed"
 	RBDMirrorReasonCephConnectionCleanupFailed     = "CephConnectionCleanupFailed"
 	RBDMirrorReasonCephObservationFailed           = "CephObservationFailed"
-	RBDMirrorReasonCephClusterIDMismatch           = "CephClusterIDMismtach"
+	RBDMirrorReasonCephClusterIDMismatch           = "CephClusterIDMismatch"
 	RBDMirrorReasonCephPoolNotFound                = "CephPoolNotFound"
 
 	RBDMirrorReasonCephPoolObservationFailed      = "CephPoolObservationFailed"
@@ -138,7 +138,10 @@ type RBDMirrorStatus struct {
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
-
+// +kubebuilder:resource:scope=Namespaced
+// +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=".status.phase"
+// +kubebuilder:printcolumn:name="Ready",type=string,JSONPath=".status.conditions[?(@.type=='Ready')].status"
+// +kubebuilder:printcolumn:name="Age",type=date,JSONPath=".metadata.creationTimestamp"
 type RBDMirror struct {
 	metav1.TypeMeta `json:",inline"`
 

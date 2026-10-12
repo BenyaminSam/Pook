@@ -1,127 +1,161 @@
 package controller
 
 import (
+	"reflect"
+	"testing"
+
 	storagev1alpha1 "github.com/BenyaminSam/pook/api/v1alpha1"
-
-	. "github.com/onsi/ginkgo/v2"
-	. "github.com/onsi/gomega"
-
-	"k8s.io/apimachinery/pkg/api/meta"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-var _ = Describe("RBDMirror initial status", func() {
-	It("reports a pending assessment without rewriting unchanged status", func() {
-		mirror := &storagev1alpha1.RBDMirror{
-			ObjectMeta: metav1.ObjectMeta{
-				GenerateName: "status-test-",
-				Namespace:    "default",
-			},
-			Spec: storagev1alpha1.RBDMirrorSpec{
-				LocalCluster: storagev1alpha1.CephClusterConnectionSpec{
-					ClusterID: "local",
-					ConfigSecretRef: storagev1alpha1.CephSecretReference{
-						Name: "local-config",
-					},
-					CredentialsSecretRef: storagev1alpha1.CephSecretReference{
-						Name: "local-credentials",
-					},
+func TestApplyPoolPlanningStatus(t *testing.T) {
+	tests := []struct {
+		name        string
+		blocked     bool
+		reason      string
+		phase       storagev1alpha1.RBDMirrorPhase
+		progressing metav1.ConditionStatus
+		degraded    metav1.ConditionStatus
+	}{
+		{
+			name:        "verification pending",
+			reason:      "PoolPeerVerificationPending",
+			phase:       storagev1alpha1.RBDMirrorPhaseConfiguring,
+			progressing: metav1.ConditionTrue,
+			degraded:    metav1.ConditionFalse,
+		},
+		{
+			name:        "configuration conflict",
+			blocked:     true,
+			reason:      "PoolPeerConflict",
+			phase:       storagev1alpha1.RBDMirrorPhaseFailed,
+			progressing: metav1.ConditionFalse,
+			degraded:    metav1.ConditionTrue,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mirror := &storagev1alpha1.RBDMirror{
+				ObjectMeta: metav1.ObjectMeta{
+					Generation: 7,
 				},
-				PeerCluster: storagev1alpha1.CephClusterConnectionSpec{
-					ClusterID: "peer",
-					ConfigSecretRef: storagev1alpha1.CephSecretReference{
-						Name: "peer-config",
-					},
-					CredentialsSecretRef: storagev1alpha1.CephSecretReference{
-						Name: "peer-credentials",
-					},
-				},
-				Pools: []storagev1alpha1.RBDMirrorPoolSpec{
-					{
-						Name:      "replicated-pool",
-						Mode:      "journal",
-						Direction: "rx-tx",
-					},
-				},
-			},
-		}
+			}
 
-		Expect(k8sClient.Create(ctx, mirror)).To(Succeed())
+			const message = "Test reconciliation result"
 
-		DeferCleanup(func() {
-			Expect(client.IgnoreNotFound(
-				k8sClient.Delete(ctx, mirror),
-			)).To(Succeed())
-		})
-
-		reconciler := &RBDMirrorReconciler{
-			Client: k8sClient,
-			Scheme: k8sClient.Scheme(),
-		}
-
-		key := client.ObjectKeyFromObject(mirror)
-		request := ctrl.Request{NamespacedName: key}
-
-		By("recording the initial assessment")
-		result, err := reconciler.Reconcile(ctx, request)
-		Expect(err).NotTo(HaveOccurred())
-		Expect(result).To(Equal(ctrl.Result{}))
-
-		first := &storagev1alpha1.RBDMirror{}
-		Expect(k8sClient.Get(ctx, key, first)).To(Succeed())
-
-		Expect(first.Status.Phase).To(Equal(
-			storagev1alpha1.RBDMirrorPhasePending,
-		))
-		Expect(first.Status.ObservedGeneration).To(Equal(first.Generation))
-		Expect(first.Status.Conditions).To(HaveLen(3))
-
-		expectedConditions := []struct {
-			conditionType storagev1alpha1.RBDMirrorConditionType
-			status        metav1.ConditionStatus
-			reason        string
-		}{
-			{
-				conditionType: storagev1alpha1.RBDMirrorConditionReady,
-				status:        metav1.ConditionFalse,
-				reason:        storagev1alpha1.RBDMirrorReasonDependenciesNotChecked,
-			},
-			{
-				conditionType: storagev1alpha1.RBDMirrorConditionProgressing,
-				status:        metav1.ConditionFalse,
-				reason:        storagev1alpha1.RBDMirrorReasonReconciliationNotStarted,
-			},
-			{
-				conditionType: storagev1alpha1.RBDMirrorConditionDegraded,
-				status:        metav1.ConditionUnknown,
-				reason:        storagev1alpha1.RBDMirrorReasonDependenciesNotChecked,
-			},
-		}
-
-		for _, expected := range expectedConditions {
-			condition := meta.FindStatusCondition(
-				first.Status.Conditions,
-				string(expected.conditionType),
+			applyPoolPlanningStatus(
+				mirror,
+				tt.blocked,
+				tt.reason,
+				message,
 			)
 
-			Expect(condition).NotTo(BeNil())
-			Expect(condition.Status).To(Equal(expected.status))
-			Expect(condition.Reason).To(Equal(expected.reason))
-			Expect(condition.ObservedGeneration).To(Equal(first.Generation))
-			Expect(condition.LastTransitionTime.IsZero()).To(BeFalse())
-		}
+			if mirror.Status.Phase != tt.phase {
+				t.Fatalf(
+					"phase = %q, want %q",
+					mirror.Status.Phase,
+					tt.phase,
+				)
+			}
 
-		By("reconciling again without changing the persisted object")
-		result, err = reconciler.Reconcile(ctx, request)
-		Expect(err).NotTo(HaveOccurred())
-		Expect(result).To(Equal(ctrl.Result{}))
+			if mirror.Status.ObservedGeneration != mirror.Generation {
+				t.Fatalf(
+					"observed generation = %d, want %d",
+					mirror.Status.ObservedGeneration,
+					mirror.Generation,
+				)
+			}
 
-		second := &storagev1alpha1.RBDMirror{}
-		Expect(k8sClient.Get(ctx, key, second)).To(Succeed())
+			expected := map[string]metav1.ConditionStatus{
+				string(storagev1alpha1.RBDMirrorConditionReady):       metav1.ConditionFalse,
+				string(storagev1alpha1.RBDMirrorConditionProgressing): tt.progressing,
+				string(storagev1alpha1.RBDMirrorConditionDegraded):    tt.degraded,
+			}
 
-		Expect(second.Status).To(Equal(first.Status))
-		Expect(second.ResourceVersion).To(Equal(first.ResourceVersion))
-	})
-})
+			if len(mirror.Status.Conditions) != len(expected) {
+				t.Fatalf(
+					"condition count = %d, want %d",
+					len(mirror.Status.Conditions),
+					len(expected),
+				)
+			}
+
+			for conditionType, wantStatus := range expected {
+				condition := apimeta.FindStatusCondition(
+					mirror.Status.Conditions,
+					conditionType,
+				)
+
+				if condition == nil {
+					t.Fatalf("missing condition %q", conditionType)
+				}
+
+				if condition.Status != wantStatus {
+					t.Errorf(
+						"%s status = %q, want %q",
+						conditionType,
+						condition.Status,
+						wantStatus,
+					)
+				}
+
+				if condition.Reason != tt.reason {
+					t.Errorf(
+						"%s reason = %q, want %q",
+						conditionType,
+						condition.Reason,
+						tt.reason,
+					)
+				}
+
+				if condition.Message != message {
+					t.Errorf(
+						"%s message = %q, want %q",
+						conditionType,
+						condition.Message,
+						message,
+					)
+				}
+
+				if condition.ObservedGeneration != mirror.Generation {
+					t.Errorf(
+						"%s observed generation = %d, want %d",
+						conditionType,
+						condition.ObservedGeneration,
+						mirror.Generation,
+					)
+				}
+			}
+		})
+	}
+}
+
+func TestApplyPoolPlanningStatusIsStable(t *testing.T) {
+	mirror := &storagev1alpha1.RBDMirror{
+		ObjectMeta: metav1.ObjectMeta{
+			Generation: 3,
+		},
+	}
+
+	applyPoolPlanningStatus(
+		mirror,
+		false,
+		"PoolPeerVerificationPending",
+		"Waiting for observation",
+	)
+
+	before := mirror.DeepCopy()
+
+	applyPoolPlanningStatus(
+		mirror,
+		false,
+		"PoolPeerVerificationPending",
+		"Waiting for observation",
+	)
+
+	if !reflect.DeepEqual(before.Status, mirror.Status) {
+		t.Fatal("identical planning results changed the resource status")
+	}
+}

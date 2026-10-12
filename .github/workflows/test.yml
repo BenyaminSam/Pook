@@ -4,26 +4,45 @@ on:
   push:
   pull_request:
 
-permissions: {}
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
-    permissions:
-      contents: read
-    name: Run on Ubuntu
+    name: Go tests and generated files
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+
     steps:
-      - name: Clone the code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           persist-credentials: false
 
-      - name: Setup Go
-        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+      - name: Set up Go
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417
         with:
           go-version-file: go.mod
+          cache: true
 
-      - name: Running Tests
+      - name: Verify module files
         run: |
           go mod tidy
-          make test
+          git diff --exit-code -- go.mod go.sum
+          go mod verify
+
+      - name: Run tests
+        run: make test
+
+      - name: Verify generated files and formatting
+        run: |
+          git diff --exit-code
+          untracked="$(git ls-files --others --exclude-standard)"
+          if [ -n "$untracked" ]; then
+            printf 'Unexpected untracked files:\n%s\n' "$untracked"
+            exit 1
+          fi
